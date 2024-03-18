@@ -17,7 +17,6 @@ import reactor.core.publisher.Mono;
 import java.util.Date;
 import java.util.List;
 import java.util.Optional;
-import java.util.stream.Collectors;
 
 @Service
 @RefreshScope
@@ -33,6 +32,9 @@ public class ConcertServiceImpl implements ConcertService {
 
     @Autowired
     private ConcertsConfiguration config;
+
+    @Autowired
+    private WebClient.Builder builder;
 
     @Override
     public Mono<Concert> createConcert(Concert concert) {
@@ -54,10 +56,17 @@ public class ConcertServiceImpl implements ConcertService {
             //  - look for a ticket service with the concert name
             //  -- If found, get the amount of available tickets
             //  -- decorate the concert with the available tickets
+
+           /*
             List<Concert> concerts = allConcerts.toStream().collect(Collectors.toList());
             concerts.forEach(concert -> findMatchingTicketsService(concert)
                     .ifPresent(serviceInstance -> decorateConcertWithTicketsInfo(concert, serviceInstance)));
-            return Flux.fromIterable(concerts);
+            */
+            return allConcerts.map(concert -> {
+                Optional<ServiceInstance> matchingTicketsService = findMatchingTicketsService(concert);
+                matchingTicketsService.ifPresent(serviceInstance -> decorateConcertWithTicketsInfo(concert, serviceInstance));
+                return concert;
+            });
         }
         return allConcerts;
     }
@@ -106,11 +115,11 @@ public class ConcertServiceImpl implements ConcertService {
     private Concert decorateConcertWithTicketsInfo(Concert concert, ServiceInstance ticketsServiceForConcert) {
         log.info("> Decorating Concert with Service : " + ticketsServiceForConcert.getServiceId());
 
-        WebClient webClient = WebClient.builder().baseUrl("http://" + ticketsServiceForConcert.getServiceId()).build();
+        //WebClient webClient = WebClient.builder().baseUrl("http://" + ticketsServiceForConcert.getServiceId()).build();
 
+        WebClient webClient = builder.baseUrl("http://" + ticketsServiceForConcert.getServiceId()).build();
         Mono<Integer> availableTickets = webClient.get().uri("/tickets").retrieve()
                 .bodyToMono(Integer.class);
-
         // I shouldn't block in here
         String remainingTickets = availableTickets.block().toString();
         log.info("> Available Tickets for " + concert.getName() + ": " + remainingTickets);
