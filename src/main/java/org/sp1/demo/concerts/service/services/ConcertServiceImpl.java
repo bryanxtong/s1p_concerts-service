@@ -7,8 +7,9 @@ import org.sp1.demo.concerts.service.model.Concert;
 import org.sp1.demo.concerts.service.repo.ConcertRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cloud.client.ServiceInstance;
-import org.springframework.cloud.client.discovery.DiscoveryClient;
+import org.springframework.cloud.client.loadbalancer.reactive.ReactorLoadBalancerExchangeFilterFunction;
 import org.springframework.cloud.context.config.annotation.RefreshScope;
+import org.springframework.cloud.kubernetes.discovery.KubernetesReactiveDiscoveryClient;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
@@ -16,7 +17,6 @@ import reactor.core.publisher.Mono;
 
 import java.util.Date;
 import java.util.List;
-import java.util.Optional;
 
 @Service
 @RefreshScope
@@ -28,13 +28,13 @@ public class ConcertServiceImpl implements ConcertService {
     private ConcertRepository concertRepository;
 
     @Autowired
-    private DiscoveryClient discoveryClient;
+    private KubernetesReactiveDiscoveryClient discoveryClient;
 
     @Autowired
     private ConcertsConfiguration config;
 
     @Autowired
-    private WebClient.Builder builder;
+    private ReactorLoadBalancerExchangeFilterFunction lbFunction;
 
     @Override
     public Mono<Concert> createConcert(Concert concert) {
@@ -56,16 +56,19 @@ public class ConcertServiceImpl implements ConcertService {
             //  - look for a ticket service with the concert name
             //  -- If found, get the amount of available tickets
             //  -- decorate the concert with the available tickets
-
-           /*
-            List<Concert> concerts = allConcerts.toStream().collect(Collectors.toList());
+/*            List<Concert> concerts = allConcerts.toStream().collect(Collectors.toList());
             concerts.forEach(concert -> findMatchingTicketsService(concert)
                     .ifPresent(serviceInstance -> decorateConcertWithTicketsInfo(concert, serviceInstance)));
-            */
-            return allConcerts.map(concert -> {
-                Optional<ServiceInstance> matchingTicketsService = findMatchingTicketsService(concert);
-                matchingTicketsService.ifPresent(serviceInstance -> decorateConcertWithTicketsInfo(concert, serviceInstance));
-                return concert;
+            return Flux.fromIterable(concerts);*/
+            return allConcerts.flatMap(concert -> {
+                return findMatchingTicketsService(concert)
+                        .flatMap(serviceInstances -> {
+                            if (serviceInstances.size() > 0) {
+                                return decorateConcertWithTicketsInfo(concert, serviceInstances.get(0));
+                            } else {
+                                return decorateConcertWithTicketsInfo(concert, null);
+                            }
+                        });
             });
         }
         return allConcerts;
@@ -87,47 +90,53 @@ public class ConcertServiceImpl implements ConcertService {
         // Get the concert from the local Repo
         Mono<Concert> concertMono = concertRepository.findById(id).
                 switchIfEmpty(Mono.error(new Exception("No Concert found with Id: " + id)));
-        return concertMono.doOnSuccess(concert -> findMatchingTicketsService(concert)
-                .ifPresent(serviceInstance -> decorateConcertWithTicketsInfo(concert, serviceInstance)));
+        return concertMono.doOnSuccess(concert ->
+                findMatchingTicketsService(concert)
+                        .flatMap(serviceInstances -> {
+                            if (serviceInstances.size() > 0) {
+                                return decorateConcertWithTicketsInfo(concert, serviceInstances.get(0));
+                            } else {
+                                return decorateConcertWithTicketsInfo(concert, null);
+                            }
+                        }));
 
     }
 
-    private Optional<ServiceInstance> findMatchingTicketsService(Concert concert) {
-        List<String> services = discoveryClient.getServices();
+    private Mono<List<ServiceInstance>> findMatchingTicketsService(Concert concert) {
+        Flux<String> services = discoveryClient.getServices();
         // Get service instance to check for extra metadata to bind concert code with tickets services
         log.info("> Finding Matching Tickets service for code: " + concert.getCode());
-
-        Optional<ServiceInstance> serviceInstance = Optional.empty();
-        for(String ticketsService : services){
-            serviceInstance = discoveryClient.getInstances(ticketsService)
-                        .stream()
-                        .filter(instance -> concert.getCode().equals(instance.getMetadata().get("code")))
-                        .findFirst();
-            // There should be another way to not do this
-            if(serviceInstance.isPresent()){
-                return serviceInstance;
-            }
-        }
-        return serviceInstance;
+        Flux<ServiceInstance> serviceInstanceFlux = services
+                .flatMap(service -> discoveryClient.getInstances(service))
+                .filter(instance -> concert.getCode().equals(instance.getMetadata().get("code")));
+        Mono<List<ServiceInstance>> listMono = serviceInstanceFlux.collectList();
+        return listMono;
 
     }
 
-    private Concert decorateConcertWithTicketsInfo(Concert concert, ServiceInstance ticketsServiceForConcert) {
+    private Mono<Concert> decorateConcertWithTicketsInfo(Concert concert, ServiceInstance ticketsServiceForConcert) {
+
+        if (ticketsServiceForConcert == null){
+            return Mono.just(concert);
+        }
         log.info("> Decorating Concert with Service : " + ticketsServiceForConcert.getServiceId());
-
-        //WebClient webClient = WebClient.builder().baseUrl("http://" + ticketsServiceForConcert.getServiceId()).build();
-
-        WebClient webClient = builder.baseUrl("http://" + ticketsServiceForConcert.getServiceId()).build();
-        Mono<Integer> availableTickets = webClient.get().uri("/tickets").retrieve()
-                .bodyToMono(Integer.class);
-        // I shouldn't block in here
-        String remainingTickets = availableTickets.block().toString();
-        log.info("> Available Tickets for " + concert.getName() + ": " + remainingTickets);
-
-        concert.setAvailableTickets(remainingTickets);
-
-        return concert;
-
+        return Mono.just(ticketsServiceForConcert).flatMap(serviceInstance -> {
+            WebClient webClient = WebClient.builder()
+                    .baseUrl("http://" + serviceInstance.getServiceId())
+                    .filter(lbFunction)
+                    .build();
+            Mono<Integer> availableTickets = webClient
+                    .get()
+                    .uri("/tickets")
+                    .retrieve()
+                    .bodyToMono(Integer.class);
+            Mono<Concert> map = availableTickets.map(ti -> {
+                log.info("> Available Tickets for " + concert.getName() + ": " + ti);
+                concert.setAvailableTickets(ti.toString());
+                return concert;
+            });
+            return map;
+        });
     }
 
     @Override
